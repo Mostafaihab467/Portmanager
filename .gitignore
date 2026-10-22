@@ -1,0 +1,18 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# app-generated settings (window size, last filter, refresh interval)
+settings.json
+
+# exports and logs
+*.csv
+*.log
+
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
