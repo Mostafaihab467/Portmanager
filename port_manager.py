@@ -15,6 +15,7 @@ import csv
 import json
 import os
 import queue
+import sys
 import threading
 import time
 from datetime import datetime
@@ -28,8 +29,66 @@ import net_inspector as ni
 APP_TITLE = "Port Manager"
 APP_VERSION = "1.0"
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+# When frozen by PyInstaller the exe lives in BASE_DIR and the bundled files in
+# _MEIPASS, so settings stay next to the exe while icons come from the bundle.
+IS_FROZEN = bool(getattr(sys, "frozen", False))
+BASE_DIR = (
+    os.path.dirname(sys.executable)
+    if IS_FROZEN
+    else os.path.dirname(os.path.abspath(__file__))
+)
+RESOURCE_DIR = getattr(sys, "_MEIPASS", BASE_DIR)
 SETTINGS_FILE = os.path.join(BASE_DIR, "settings.json")
+ICON_ICO = os.path.join(RESOURCE_DIR, "assets", "icon.ico")
+ICON_PNG = os.path.join(RESOURCE_DIR, "assets", "icon.png")
+
+# A read-only install (e.g. /opt/PortManager) still needs somewhere to persist.
+FALLBACK_SETTINGS_FILE = os.path.join(
+    os.environ.get("APPDATA") or os.path.join(os.path.expanduser("~"), ".config"),
+    "PortManager",
+    "settings.json",
+)
+
+
+def load_settings_file() -> dict:
+    for path in (SETTINGS_FILE, FALLBACK_SETTINGS_FILE):
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                return json.load(fh)
+        except Exception:
+            continue
+    return {}
+
+
+def save_settings_file(data: dict) -> None:
+    for path in (SETTINGS_FILE, FALLBACK_SETTINGS_FILE):
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w", encoding="utf-8") as fh:
+                json.dump(data, fh, indent=2)
+            return
+        except Exception:
+            continue
+
+
+def pick_font(preferred: str, fallback: str) -> str:
+    return preferred if os.name == "nt" else fallback
+
+
+UI_FONT = pick_font("Segoe UI", "DejaVu Sans")
+MONO_FONT = pick_font("Consolas", "DejaVu Sans Mono")
+
+
+def set_window_icon(window: tk.Tk) -> None:
+    """Apply the app icon to the title bar, taskbar and dock."""
+    try:
+        if os.name == "nt" and os.path.exists(ICON_ICO):
+            window.iconbitmap(ICON_ICO)
+        if os.path.exists(ICON_PNG):
+            window._app_icon = tk.PhotoImage(file=ICON_PNG)
+            window.iconphoto(True, window._app_icon)
+    except tk.TclError:
+        pass
 
 PORT_PRESETS: Dict[str, List[int]] = {
     "All": [],
@@ -68,11 +127,12 @@ def enable_dpi_awareness() -> None:
 
 
 class PortManagerApp(tk.Tk):
-    def __init__(self) -> None:
-        super().__init__()
+    def __init__(self, **kw) -> None:
+        super().__init__(**kw)
         enable_dpi_awareness()
 
         self.title(APP_TITLE)
+        set_window_icon(self)
         self.geometry("1280x720")
         self.minsize(900, 480)
 
@@ -118,25 +178,18 @@ class PortManagerApp(tk.Tk):
     # settings
     # ------------------------------------------------------------------ #
     def _load_settings(self) -> dict:
-        try:
-            with open(SETTINGS_FILE, "r", encoding="utf-8") as fh:
-                return json.load(fh)
-        except Exception:
-            return {}
+        return load_settings_file()
 
     def _save_settings(self) -> None:
-        data = {
-            "interval": self.interval.get(),
-            "auto_refresh": self.auto_refresh.get(),
-            "query": self.query.get(),
-            "preset": self.preset_var.get(),
-            "geometry": self.geometry(),
-        }
-        try:
-            with open(SETTINGS_FILE, "w", encoding="utf-8") as fh:
-                json.dump(data, fh, indent=2)
-        except Exception:
-            pass
+        save_settings_file(
+            {
+                "interval": self.interval.get(),
+                "auto_refresh": self.auto_refresh.get(),
+                "query": self.query.get(),
+                "preset": self.preset_var.get(),
+                "geometry": self.geometry(),
+            }
+        )
 
     # ------------------------------------------------------------------ #
     # UI construction
@@ -148,7 +201,7 @@ class PortManagerApp(tk.Tk):
         except tk.TclError:
             pass
         style.configure("Treeview", rowheight=22)
-        style.configure("Treeview.Heading", font=("Segoe UI", 9, "bold"))
+        style.configure("Treeview.Heading", font=(UI_FONT, 9, "bold"))
         style.configure("Toolbutton", padding=(6, 3))
         style.configure("Status.TLabel", foreground="#444444")
 
@@ -328,7 +381,7 @@ class PortManagerApp(tk.Tk):
         self.log_frame = ttk.LabelFrame(self, text="Activity log", padding=(4, 4))
         self.log_frame.pack(fill=tk.X, padx=8, pady=(0, 4))
         self.log = tk.Text(self.log_frame, height=5, wrap=tk.NONE, state=tk.DISABLED,
-                           font=("Consolas", 9))
+                           font=(MONO_FONT, 9))
         sb = ttk.Scrollbar(self.log_frame, orient=tk.VERTICAL, command=self.log.yview)
         self.log.configure(yscrollcommand=sb.set)
         self.log.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
@@ -507,7 +560,7 @@ class PortManagerApp(tk.Tk):
             return False
         if self.only_listening.get():
             if c.proto == "UDP":
-                if c.status not in ("UDP", "NONE", ""):
+                if c.status not in ("UDP", "NONE", "UNCONN", ""):
                     return False
             elif c.status not in ("LISTENING", "LISTEN", "BOUND"):
                 return False
@@ -717,6 +770,7 @@ class PortManagerApp(tk.Tk):
     def kill_by_port_dialog(self) -> None:
         dlg = tk.Toplevel(self)
         dlg.title("Kill process by port")
+        set_window_icon(dlg)
         dlg.transient(self)
         dlg.resizable(False, False)
         frame = ttk.Frame(dlg, padding=12)
@@ -791,11 +845,12 @@ class PortManagerApp(tk.Tk):
         details = ni.process_details(rec.pid) if rec.pid else {}
         dlg = tk.Toplevel(self)
         dlg.title(f"Process details - {rec.process or rec.pid}")
+        set_window_icon(dlg)
         dlg.geometry("620x380")
         dlg.transient(self)
         frame = ttk.Frame(dlg, padding=10)
         frame.pack(fill=tk.BOTH, expand=True)
-        text = tk.Text(frame, wrap=tk.WORD, font=("Consolas", 9))
+        text = tk.Text(frame, wrap=tk.WORD, font=(MONO_FONT, 9))
         sb = ttk.Scrollbar(frame, orient=tk.VERTICAL, command=text.yview)
         sb.pack(side=tk.RIGHT, fill=tk.Y)
         text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
@@ -904,7 +959,9 @@ class PortManagerApp(tk.Tk):
 
 
 def main() -> None:
-    app = PortManagerApp()
+    # The class name becomes WM_CLASS on X11, which is what StartupWMClass in
+    # port-manager.desktop matches so the dock reuses this icon.
+    app = PortManagerApp(className="Port Manager")
     app.mainloop()
 
 

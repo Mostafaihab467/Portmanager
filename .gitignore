@@ -5,6 +5,10 @@ __pycache__/
 venv/
 env/
 
+# PyInstaller output (build_portable.bat)
+dist/
+build/
+
 # app-generated settings (window size, last filter, refresh interval)
 settings.json
 

@@ -13,8 +13,10 @@ from __future__ import annotations
 import csv
 import ctypes
 import os
+import re
 import socket
 import subprocess
+import sys
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
@@ -24,8 +26,11 @@ except Exception:  # pragma: no cover
     psutil = None  # type: ignore
 
 IS_WINDOWS = os.name == "nt"
+IS_MACOS = sys.platform == "darwin"
 
 CREATE_NO_WINDOW = 0x08000000 if IS_WINDOWS else 0
+# `creationflags` is rejected by subprocess on POSIX, so only pass it on Windows.
+SUBPROCESS_FLAGS: Dict = {"creationflags": CREATE_NO_WINDOW} if IS_WINDOWS else {}
 
 
 @dataclass
@@ -62,10 +67,10 @@ def format_address(host: str, port: int) -> str:
 # process helpers
 # --------------------------------------------------------------------------- #
 def is_elevated() -> bool:
-    """True when the app runs with administrator rights."""
+    """True when the app runs with administrator / root rights."""
     if IS_WINDOWS:
         try:
-            return bool(ctypes.windll.shell32.IsUserAnAnElevated())
+            return bool(ctypes.windll.shell32.IsUserAnAdmin())
         except Exception:
             return False
     try:
@@ -82,7 +87,17 @@ def pid_exists(pid: int) -> bool:
             return psutil.pid_exists(pid)
         except Exception:
             pass
-    return _windows_pid_exists(pid)
+    if IS_WINDOWS:
+        return _windows_pid_exists(pid)
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
 
 
 def _windows_pid_exists(pid: int) -> bool:
@@ -107,7 +122,7 @@ def tasklist_processes() -> Dict[int, str]:
             capture_output=True,
             text=True,
             timeout=20,
-            creationflags=CREATE_NO_WINDOW,
+            **SUBPROCESS_FLAGS,
         )
     except Exception:
         return result
@@ -122,6 +137,27 @@ def tasklist_processes() -> Dict[int, str]:
     return result
 
 
+def _posix_process_name(pid: int) -> str:
+    """Process name from /proc, falling back to `ps`."""
+    try:
+        with open(f"/proc/{pid}/comm", "r", encoding="utf-8", errors="replace") as fh:
+            name = fh.read().strip()
+        if name:
+            return name
+    except OSError:
+        pass
+    try:
+        out = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "comm="],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        return out.stdout.strip()
+    except Exception:
+        return ""
+
+
 def process_name(pid: int) -> str:
     """Best effort process image name for a PID."""
     if pid <= 0:
@@ -131,8 +167,9 @@ def process_name(pid: int) -> str:
             return psutil.Process(pid).name()
         except Exception:
             pass
-    name = tasklist_processes().get(pid)
-    return name or ""
+    if IS_WINDOWS:
+        return tasklist_processes().get(pid) or ""
+    return _posix_process_name(pid)
 
 
 def process_details(pid: int) -> Dict[str, str]:
@@ -210,7 +247,7 @@ def kill_pid(pid: int, force: bool = True, tree: bool = True) -> Tuple[bool, str
             cmd.append("/T")
         try:
             out = subprocess.run(
-                cmd, capture_output=True, text=True, timeout=20, creationflags=CREATE_NO_WINDOW
+                cmd, capture_output=True, text=True, timeout=20, **SUBPROCESS_FLAGS
             )
             ok = out.returncode == 0
             return ok, (out.stdout or out.stderr or "").strip() or f"taskkill exit {out.returncode}"
@@ -224,16 +261,33 @@ def kill_pid(pid: int, force: bool = True, tree: bool = True) -> Tuple[bool, str
         return False, f"Failed to kill PID {pid}: {exc}"
 
 
+def _run(cmd: List[str], timeout: int = 30) -> str:
+    """Run a helper command and return stdout, or '' when it is unavailable."""
+    try:
+        out = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=timeout, **SUBPROCESS_FLAGS
+        )
+    except Exception:
+        return ""
+    if out.returncode != 0:
+        return ""
+    return out.stdout or ""
+
+
 def open_process_location(pid: int) -> Tuple[bool, str]:
-    """Open Explorer with the executable of a process selected."""
-    if not IS_WINDOWS:
-        return False, "Only supported on Windows."
+    """Open the file manager with the executable of a selected process."""
     details = process_details(pid)
     exe = details.get("exe") or ""
     if not exe:
-        return False, "Executable path unavailable (needs administrator rights)."
+        hint = " (needs administrator rights)" if IS_WINDOWS else " (needs root rights)"
+        return False, f"Executable path unavailable{hint}."
     try:
-        subprocess.Popen(["explorer", "/select,", exe])
+        if IS_WINDOWS:
+            subprocess.Popen(["explorer", "/select,", exe], **SUBPROCESS_FLAGS)
+        elif IS_MACOS:
+            subprocess.Popen(["open", "-R", exe])
+        else:
+            subprocess.Popen(["xdg-open", os.path.dirname(exe)])
         return True, f"Opened location of {os.path.basename(exe)}."
     except Exception as exc:
         return False, str(exc)
@@ -300,18 +354,12 @@ def collect_psutil() -> List[Connection]:
 
 def collect_netstat() -> List[Connection]:
     """Windows fallback collector based on `netstat -ano`."""
-    if not IS_WINDOWS:
-        raise RuntimeError("netstat collector is Windows only")
-    out = subprocess.run(
-        ["netstat", "-ano"],
-        capture_output=True,
-        text=True,
-        timeout=30,
-        creationflags=CREATE_NO_WINDOW,
-    )
+    stdout = _run(["netstat", "-ano"])
+    if not stdout:
+        raise RuntimeError("netstat unavailable - install psutil (`pip install -r requirements.txt`).")
     names = tasklist_processes()
     conns: List[Connection] = []
-    for line in out.stdout.splitlines():
+    for line in stdout.splitlines():
         parts = line.split()
         if len(parts) < 3:
             continue
@@ -346,16 +394,126 @@ def collect_netstat() -> List[Connection]:
     return conns
 
 
+_SS_PID_RE = re.compile(r'pid=(\d+)')
+_SS_NAME_RE = re.compile(r'users:\(\("([^"]+)"')
+_NETSTAT_PID_RE = re.compile(r"(\d+)/(.+)")
+
+
+def collect_ss() -> List[Connection]:
+    """Linux collector based on `ss -tunap`."""
+    stdout = _run(["ss", "-tunap"])
+    if not stdout:
+        raise RuntimeError("ss unavailable")
+    conns: List[Connection] = []
+    for line in stdout.splitlines():
+        parts = line.split()
+        if len(parts) < 6:
+            continue
+        netid = parts[0].rstrip("46").lower()
+        if netid not in ("tcp", "udp"):
+            continue
+        proto = "UDP" if netid == "udp" else "TCP"
+        status = parts[1].upper()
+        if status == "LISTEN":
+            status = "LISTENING"
+        elif status in ("UNCONN", ""):
+            status = "UDP" if proto == "UDP" else ""
+        lhost, lport = _split_addr(parts[4])
+        rhost, rport = _split_addr(parts[5])
+        pid = 0
+        name = ""
+        pid_match = _SS_PID_RE.search(line)
+        if pid_match:
+            pid = int(pid_match.group(1))
+            name_match = _SS_NAME_RE.search(line)
+            if name_match:
+                name = name_match.group(1)
+        if pid and not name:
+            name = process_name(pid)
+        conns.append(
+            Connection(
+                proto=proto,
+                local_host=lhost,
+                local_port=lport,
+                remote_host=rhost,
+                remote_port=rport,
+                status=status,
+                pid=pid,
+                process=name,
+            )
+        )
+    if not conns:
+        raise RuntimeError("ss returned no rows")
+    return conns
+
+
+def collect_posix_netstat() -> List[Connection]:
+    """Fallback collector for Linux/macOS using `netstat -tulnp`."""
+    stdout = _run(["netstat", "-tulnp"]) or _run(["netstat", "-tuln"])
+    if not stdout:
+        raise RuntimeError("netstat unavailable")
+    conns: List[Connection] = []
+    for line in stdout.splitlines():
+        parts = line.split()
+        if len(parts) < 5:
+            continue
+        proto = parts[0].rstrip("46").upper()
+        if proto not in ("TCP", "UDP"):
+            continue
+        lhost, lport = _split_addr(parts[3])
+        rhost, rport = _split_addr(parts[4])
+        owner = parts[-1]
+        pid = 0
+        name = ""
+        owner_match = _NETSTAT_PID_RE.fullmatch(owner)
+        if owner_match:
+            pid, name = int(owner_match.group(1)), owner_match.group(2)
+        elif owner.isdigit():
+            pid = int(owner)
+        status = ""
+        if pid and len(parts) >= 7:
+            status = parts[5].upper()
+        if status == "LISTEN":
+            status = "LISTENING"
+        if proto == "UDP" and not status:
+            status = "UDP"
+        if pid and not name:
+            name = process_name(pid)
+        conns.append(
+            Connection(
+                proto=proto,
+                local_host=lhost,
+                local_port=lport,
+                remote_host=rhost,
+                remote_port=rport,
+                status=status,
+                pid=pid,
+                process=name,
+            )
+        )
+    if not conns:
+        raise RuntimeError("netstat returned no rows")
+    return conns
+
+
+def collect_posix() -> Tuple[List[Connection], str]:
+    """Prefer `ss` (the default tool on modern distros), fall back to `netstat`."""
+    try:
+        return collect_ss(), "ss"
+    except Exception:
+        return collect_posix_netstat(), "netstat"
+
+
 def collect_connections() -> Tuple[List[Connection], str]:
     """Collect connections, returns (connections, backend name)."""
     if psutil is not None:
         try:
             return collect_psutil(), "psutil"
-        except psutil.AccessDenied:
-            pass
         except Exception:
             pass
-    return collect_netstat(), "netstat"
+    if IS_WINDOWS:
+        return collect_netstat(), "netstat"
+    return collect_posix()
 
 
 def pids_listening_on(port: int, proto: str = "") -> List[int]:

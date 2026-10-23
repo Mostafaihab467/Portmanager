@@ -29,8 +29,11 @@ interval and the ability to kill whatever is holding a port.
 
 ## Requirements
 
-* Windows (also runs on Linux/macOS), Python 3.8+
-* `psutil` (optional but recommended - the app falls back to `netstat` without it)
+* Python 3.8+ with Tkinter, on Windows, Linux or macOS
+  (Linux: `sudo apt install python3-tk`; the socket fallback also uses `ss`
+  from `iproute2`, or `netstat` from `net-tools`)
+* `psutil` (optional but recommended - without it the app parses `netstat`
+  on Windows and `ss`/`netstat` on Linux, which hides other users' processes)
 
 ```
 pip install -r requirements.txt
@@ -40,18 +43,58 @@ or just double-click `install_deps.bat`.
 
 ## Run
 
+| OS | Command |
+| --- | --- |
+| Windows | double-click `run.bat`, or `python port_manager.py` |
+| Linux / macOS | `./port_manager.sh`, or `python3 port_manager.py` |
+
+## Shortcuts and app menu entries
+
+Windows - creates a Start Menu entry, a Desktop shortcut and a
+*Port Manager (Administrator)* entry, all using `assets/icon.ico`:
+
 ```
-python port_manager.py
+install_shortcut.bat
 ```
 
-or double-click `run.bat`.
+The Start Menu entry shows up when you press the Windows key and type
+"Port Manager"; right-click it to *Pin to Start* or *Pin to taskbar*.
+If you have run `build_portable.bat` (below) the shortcuts start the built
+`PortManager.exe`; otherwise they start the script with `pythonw.exe`.
 
-## Running as administrator
+Linux - installs a `.desktop` entry into `~/.local/share/applications` (and a
+copy on the Desktop, where GNOME/KDE need a right-click → *Allow Launching*
+before the first run):
+
+```
+./install_linux_desktop.sh
+```
+
+## Standalone Windows build (optional)
+
+Explorer, Alt-Tab and Task Manager read an icon from the *executable* of the
+process that owns the window, so while the app runs from `pythonw.exe` those
+lists show the Python logo (the title bar and taskbar already show the app
+icon). Build your own executable to fix that:
+
+```
+python -m pip install pyinstaller      # once
+build_portable.bat
+```
+
+That produces `dist\PortManager\PortManager.exe` (~26 MB folder) with the icon
+and version info embedded, so Task Manager lists it as **Port Manager** with
+its own icon and it runs on machines that have no Python installed. Copy the
+whole `PortManager` folder to move it; `settings.json` is written next to the
+exe. Re-run `install_shortcut.bat` afterwards to point the shortcuts at it.
+
+## Running with elevated rights
 
 Windows only lets you kill processes owned by another user or started by a
-service when the app runs elevated. The status bar shows `admin` when the app
-has administrator rights - right-click `run.bat` and choose *Run as
-administrator* if you see `Access denied` when killing a process.
+service when the app runs elevated; on Linux that needs root. The status bar
+shows `admin` when the app has the rights - use the *Port Manager
+(Administrator)* shortcut, right-click `run.bat` and choose *Run as
+administrator*, or start it with `sudo -E ./port_manager.sh`.
 
 ## Quick answers to common questions
 
@@ -78,16 +121,30 @@ administrator* if you see `Access denied` when killing a process.
 
 ```
 PortManager/
-├── port_manager.py     # GUI application (Tkinter)
-├── net_inspector.py    # backend: collection, process info, kill
-├── requirements.txt    # optional dependency: psutil
-├── install_deps.bat    # pip install -r requirements.txt
-├── run.bat             # start the app
-└── settings.json       # created on exit (interval, filters, window size)
+├── port_manager.py           # GUI application (Tkinter)
+├── net_inspector.py          # backend: collection, process info, kill
+├── requirements.txt          # optional dependency: psutil
+├── install_deps.bat          # pip install -r requirements.txt
+├── run.bat                   # start the app (Windows)
+├── port_manager.sh           # start the app (Linux / macOS)
+├── make_shortcut.ps1         # create Start Menu + Desktop shortcuts (Windows)
+├── install_shortcut.bat      # run make_shortcut.ps1 with one double-click
+├── build_portable.bat        # optional: build dist\PortManager\PortManager.exe
+├── version_info.txt          # version resource used by that build
+├── install_linux_desktop.sh  # install the applications-menu entry (Linux)
+├── assets/
+│   ├── icon.ico              # Windows icon (16-256 px)
+│   └── icon.png              # window / desktop icon (Linux, macOS)
+├── dist/                     # build_portable.bat output (not in git)
+└── settings.json             # created on exit (interval, filters, window size)
 ```
 
 ## Notes
 
-* `psutil` is used when available; otherwise the app parses `netstat -ano`, so it
+* `psutil` is used when available; otherwise the app parses `netstat -ano` on
+  Windows and `ss -tunap` (falling back to `netstat -tulnp`) on Linux, so it
   still works on machines without admin rights (fewer details are visible).
 * The activity log at the bottom records every kill action.
+* Settings are written next to the app; if that folder is read-only (e.g. an
+  `/opt` install) they go to `%APPDATA%\PortManager` on Windows and
+  `~/.config/PortManager` on Linux instead.
